@@ -1,0 +1,306 @@
+using System;
+using System.Threading;
+using System.IO;
+using System.IO.Compression;
+
+namespace ConsoleThreading
+{
+    public enum ZipOperation { Compress, Decompress }
+
+    class Program
+    {
+
+        static void Main(string[] args)
+        {
+            GZipInitializator GZip = new GZipInitializator(args);            
+            GZip.StartOperation();
+
+            Console.WriteLine("Нажмите любую клавишу для выхода.");
+            Console.ReadKey();
+        }
+        
+    }
+
+    public class GZipInitializator
+    {
+        //Имя входного файла.
+        string fileName;
+        //Имя выходного файла.
+        string resultName;
+        //Выполняемая операция (сжатие/распаковка).
+        ZipOperation currentOperation;
+
+        public GZipInitializator(string[] args)
+        {
+            //Если программа запущена с параметрами, вводить вручную не нужно.
+            if (args.Length == 3)
+            {
+                ParseArgs(args);
+                return;
+            }
+
+            //Запрашиваем ввод, пока не будут поданы корректные параметры.
+            do
+            {
+                Console.WriteLine("Введите входные параметры (compress/decompress [имя исходного файла] [имя результирующего файла]):");
+                string readArgs = Console.ReadLine();
+                string[] argsToParse = readArgs.Split(' ');
+                if (argsToParse.Length == 3)
+                {
+                    ParseArgs(argsToParse);
+                }
+            }
+            while (string.IsNullOrEmpty(fileName) || string.IsNullOrEmpty(resultName));
+        }
+
+        /// <summary>
+        /// Считывет параметры архивации из входных аргументов.
+        /// </summary>
+        /// <param name="args">Входные аргументы (операция, имя исходного файла, имя файла результата)</param>
+        private void ParseArgs(string[] args)
+        {
+            switch (args[0])
+            {
+                case "compress":
+                    currentOperation = ZipOperation.Compress;
+                    break;
+                case "decompress":
+                    currentOperation = ZipOperation.Decompress;
+                    break;
+                default:
+                    Console.WriteLine("Операция введена неверно (доступны только две операции: compress, decompress).");
+                    fileName = resultName = "";
+                    return;                    
+            }
+            fileName = args[1];
+            resultName = args[2];
+        }
+
+        /// <summary>
+        /// Запуск операции сжатия/распаковки.
+        /// </summary>
+        public void StartOperation()
+        {
+            if (!string.IsNullOrEmpty(fileName) && !string.IsNullOrEmpty(resultName))
+            {
+                switch (currentOperation)
+                {
+                    case ZipOperation.Compress: Compressor.Compress(fileName, resultName); break;
+                    case ZipOperation.Decompress: Compressor.Decompress(fileName, resultName); break;
+                }
+            }
+        }
+    }
+
+    public static class Compressor
+    {
+        //Количество одновременно запускаемых потоков = количество процессоров ПК.
+        static int threadNumber = Environment.ProcessorCount;
+
+        static byte[][] dataArray = new byte[threadNumber][];
+        static byte[][] compressedDataArray = new byte[threadNumber][];
+
+        //Размер одной части делимого файла = 1 Мб.
+        static int dataPortionSize = 1000000;
+        static int dataArraySize = dataPortionSize * threadNumber;
+
+        /// <summary>
+        /// Сжимает входной файл inFileName в файл с именем outFileName.
+        /// </summary>
+        /// <param name="inFileName">Имя исходного файла (с расширением).</param>
+        /// <param name="outFileName">Имя выходного файла.</param>
+        public static void Compress(string inFileName, string outFileName)
+        {            
+            try
+            {
+                if (File.Exists(outFileName + ".gz"))
+                {
+                    File.Delete(outFileName + ".gz");
+                }
+                FileStream inFile = new FileStream(inFileName, FileMode.Open);
+                FileStream outFile = new FileStream(outFileName + ".gz", FileMode.Append);
+
+                int _dataPortionSize;
+                Thread[] tPool;
+
+                ConsoleProgress conProgress = new ConsoleProgress();
+                Console.Write("Происходит сжатие, пожалуйста, подождите...");
+
+                //Циклически делим файл на части по 1 Мб на каждый поток.
+                while (inFile.Position < inFile.Length)
+                {
+                    //Меняем процент выполнения операции.
+                    conProgress.ChangeProgress((200 * inFile.Position + 1) / (inFile.Length * 2));
+                    tPool = new Thread[threadNumber];
+                    //Разбиваем файл на блоки и отдельнымии потоками их упаковываем.
+                    for (int portionCount = 0;
+                         (portionCount < threadNumber) && (inFile.Position < inFile.Length);
+                         portionCount++)
+                    {                        
+                        if (inFile.Length - inFile.Position <= dataPortionSize)
+                        {
+                            _dataPortionSize = (int)(inFile.Length - inFile.Position);
+                        }
+                        else
+                        {
+                            _dataPortionSize = dataPortionSize;
+                        }
+                        dataArray[portionCount] = new byte[_dataPortionSize];
+                        inFile.Read(dataArray[portionCount], 0, _dataPortionSize);
+
+                        tPool[portionCount] = new Thread(CompressBlock);
+                        tPool[portionCount].Start(portionCount);
+                    }
+
+                    //Записываем перед каждым блоком длинну сжатого блока для распаковки.
+                    for (int portionCount = 0; (portionCount < threadNumber) && (tPool[portionCount] != null);)
+                    {
+                        if (tPool[portionCount].ThreadState == ThreadState.Stopped)
+                        {
+                            BitConverter.GetBytes(compressedDataArray[portionCount].Length + 1)
+                                        .CopyTo(compressedDataArray[portionCount], 4);
+                            outFile.Write(compressedDataArray[portionCount], 0, compressedDataArray[portionCount].Length);
+                            portionCount++;
+                        }
+                    }
+
+                }
+
+                outFile.Close();                
+                inFile.Close();
+                conProgress.ChangeProgress(100);
+                Console.WriteLine("1");
+            }
+            catch (Exception ex)
+            {
+                if (ex is IOException)
+                    Console.WriteLine("Не найден исходный файл!");
+                else
+                    Console.WriteLine("Непредвиденная ошибка: " + ex.Message);
+                Console.WriteLine("0");
+            }
+        }
+
+        public static void CompressBlock(object i)
+        {
+            using (MemoryStream output = new MemoryStream(dataArray[(int)i].Length))
+            {
+                using (GZipStream cs = new GZipStream(output, CompressionMode.Compress))
+                {
+                    cs.Write(dataArray[(int)i], 0, dataArray[(int)i].Length);
+                }
+                compressedDataArray[(int)i] = output.ToArray();
+            }
+        }
+
+        /// <summary>
+        /// Распаковывает входной файл inFileName в файл с именем outFileName.
+        /// </summary>
+        /// <param name="inFileName">Имя исходного файла.</param>
+        /// <param name="outFileName">Имя выходного файла.</param>
+        public static void Decompress(string inFileName, string outFileName)
+        {
+            try
+            {
+                if (File.Exists(outFileName))
+                {
+                    File.Delete(outFileName);
+                }
+                FileStream inFile = new FileStream(inFileName, FileMode.Open);
+                FileStream outFile = new FileStream(outFileName, FileMode.Append);
+                int compressedBlockLength;
+                Thread[] tPool;
+
+                ConsoleProgress conProgress = new ConsoleProgress();
+                Console.Write("Происходит распаковка, пожалуйста, подождите...");
+                byte[] buffer = new byte[8];
+
+                while (inFile.Position < inFile.Length)
+                {
+                    //Меняем процент выполнения операции.
+                    conProgress.ChangeProgress((200 * inFile.Position + 1) / (inFile.Length * 2));
+                    tPool = new Thread[threadNumber];
+                    for (int portionCount = 0;
+                         (portionCount < threadNumber) && (inFile.Position < inFile.Length);
+                         portionCount++)
+                    {
+                        //Считываем длину блока
+                        inFile.Read(buffer, 0, 8);
+                        compressedBlockLength = BitConverter.ToInt32(buffer, 4);
+                        compressedDataArray[portionCount] = new byte[compressedBlockLength + 1];
+                        buffer.CopyTo(compressedDataArray[portionCount], 0);
+
+                        //Читаем сжатый блок, инициализируем массив для распакованной информации.
+                        inFile.Read(compressedDataArray[portionCount], 8, compressedBlockLength - 9);
+                        dataArray[portionCount] = new byte[dataPortionSize];
+
+                        tPool[portionCount] = new Thread(DecompressBlock);
+                        tPool[portionCount].Start(portionCount);
+                    }
+
+                    //Пишем в файл расспакованную информацию.
+                    for (int portionCount = 0; (portionCount < threadNumber) && (tPool[portionCount] != null);)
+                    {
+                        if (tPool[portionCount].ThreadState == ThreadState.Stopped)
+                        {
+                            outFile.Write(dataArray[portionCount], 0, dataArray[portionCount].Length);
+                            portionCount++;
+                        }
+                    }
+                }
+
+                outFile.Close();
+                inFile.Close();
+                conProgress.ChangeProgress(100);
+                Console.WriteLine("1");
+            }
+            catch (Exception ex)
+            {
+                if (ex is IOException)
+                    Console.WriteLine("Не найден исходный файл!");
+                else
+                    Console.WriteLine("Непредвиденная ошибка: " + ex.Message);
+                Console.WriteLine("0");
+            }
+        }
+
+        public static void DecompressBlock(object i)
+        {
+            using (MemoryStream input = new MemoryStream(compressedDataArray[(int)i]))
+            {
+
+                using (GZipStream ds = new GZipStream(input, CompressionMode.Decompress))
+                {
+                    //Кидаем расспакованную информацию в массив, если данных меньше, чем размер одной части - уменьшаем массив.
+                    int r = ds.Read(dataArray[(int)i], 0, dataArray[(int)i].Length);
+                    if (dataArray[(int)i].Length > r)
+                    {
+                        Array.Resize(ref dataArray[(int)i], r);
+                    }
+                }
+
+            }
+        }
+    }
+
+    public class ConsoleProgress
+    {
+        /// <summary>
+        /// Вывод процента выполнения операции в консоли.
+        /// </summary>
+        /// <param name="newProgress">Процент для вывода.</param>
+        public void ChangeProgress(long newProgress)
+        {
+            string output = newProgress.ToString() + "%";
+
+            if (newProgress >= 100)
+            {
+                Console.WriteLine(output);
+                return;
+            }
+            
+            Console.Write(output);
+            Console.SetCursorPosition(Console.CursorLeft - output.Length, Console.CursorTop);
+        }
+    }
+}
